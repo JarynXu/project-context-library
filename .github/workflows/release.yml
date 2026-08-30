@@ -13,7 +13,42 @@ permissions:
   contents: write
 
 jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      version: ${{ steps.metadata.outputs.version }}
+      tag: ${{ steps.metadata.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Resolve package version
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "okf-project-context-library") | .version')
+          test -n "$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Check whether this version is already published
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.metadata.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; skipping duplicate builds."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
   validate:
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -27,7 +62,8 @@ jobs:
       - run: cargo package --locked
 
   build:
-    needs: validate
+    needs: [prepare, validate]
+    if: needs.prepare.outputs.should_release == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -111,7 +147,8 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: build
+    needs: [prepare, build]
+    if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -121,25 +158,21 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Package source crate
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
           cargo package --locked
-          VERSION=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "okf-project-context-library") | .version')
           cp "target/package/okf-project-context-library-${VERSION}.crate" dist/
           (cd dist && sha256sum "okf-project-context-library-${VERSION}.crate" > "okf-project-context-library-${VERSION}.crate.sha256")
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
-          VERSION=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "okf-project-context-library") | .version')
-          TAG="v${VERSION}"
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $TAG already exists; nothing to do."
-            exit 0
-          fi
           gh release create "$TAG" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
