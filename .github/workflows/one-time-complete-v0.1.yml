@@ -43,7 +43,7 @@ jobs:
           text = text.replace("content.push('\n')", "content.push('\\n')")
           text = text.replace("bytes.push(b'\n')", "bytes.push(b'\\n')")
           text, replacements = re.subn(
-              r'''excluded_prefixes:\s*vec!\[\s*LIBRARY_DIR\.to_owned\(\),\s*"\.okf/cache"\.to_owned\(\),\s*"\.okf/libraries\.json"\.to_owned\(\),\s*\],''',
+              r'excluded_prefixes:\s*vec!\[\s*LIBRARY_DIR\.to_owned\(\),\s*"\.okf/cache"\.to_owned\(\),\s*"\.okf/libraries\.json"\.to_owned\(\),\s*\],',
               "excluded_prefixes: default_excluded_prefixes(),",
               text,
               count=1,
