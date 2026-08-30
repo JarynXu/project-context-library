@@ -33,9 +33,22 @@ jobs:
           for line in lines[marker + 1:]:
               script_lines.append(line[10:] if line.startswith("          ") else line)
           script = "\n".join(script_lines) + "\n"
+          fix_generated_rust = r'''python - <<'PY_FIX'
+          from pathlib import Path
+
+          path = Path("src/main.rs")
+          text = path.read_text()
+          text = text.replace("content.ends_with('\n')", "content.ends_with('\\n')")
+          text = text.replace("content.push('\n')", "content.push('\\n')")
+          text = text.replace("bytes.push(b'\n')", "bytes.push(b'\\n')")
+          path.write_text(text)
+          PY_FIX
+          cargo fmt --all
+          '''
+          script = script.replace("cargo fmt --all\n", fix_generated_rust, 1)
           script = script.replace(
-              '          git add --all\n',
-              '          rm -f tools/one-time-complete-v0.1.recipe .github/workflows/one-time-complete-v0.1.yml\n          rmdir tools 2>/dev/null || true\n          git add --all\n',
+              "git add --all\n",
+              "rm -f tools/one-time-complete-v0.1.recipe .github/workflows/one-time-complete-v0.1.yml\nrmdir tools 2>/dev/null || true\ngit add --all\n",
               1,
           )
           Path("/tmp/complete-project-context.sh").write_text(script)
