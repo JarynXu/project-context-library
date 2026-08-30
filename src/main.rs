@@ -14,6 +14,7 @@ const PROFILE_SCHEMA_VERSION: &str = "1";
 const PROVIDER_PROTOCOL: &str = "okf-provider/1";
 const DEFAULT_LIBRARY_ID: &str = "project-context";
 const LIBRARY_DIR: &str = ".okf/project-context";
+const MAX_PROVIDER_REQUEST_BYTES: usize = 1024 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(name = "project-context", version, about)]
@@ -115,6 +116,8 @@ struct ContextStatus {
     branch: Option<String>,
     changed_paths: Vec<String>,
     impacted_topics: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    diagnostics: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -196,23 +199,28 @@ fn run(cli: Cli) -> Result<()> {
             id,
             force,
             mount,
-        } => emit(cli.json, &init(&repository, project.as_deref(), &id, force, mount)?)?,
-        Command::Status { repository } => emit(cli.json, &status_for_repository(&repository)?)?,
+        } => emit_status(
+            cli.json,
+            &init(&repository, project.as_deref(), &id, force, mount)?,
+        )?,
+        Command::Status { repository } => {
+            emit_status(cli.json, &status_for_repository(&repository)?)?
+        }
         Command::Checkpoint {
             repository,
             revision,
-        } => emit(cli.json, &checkpoint(&repository, revision.as_deref())?)?,
-        Command::Mount { repository } => emit(cli.json, &mount_library(&repository)?)?,
+        } => emit_status(cli.json, &checkpoint(&repository, revision.as_deref())?)?,
+        Command::Mount { repository } => emit_status(cli.json, &mount_library(&repository)?)?,
         Command::Provider { library_root } => serve_provider(library_root.as_deref())?,
     }
     Ok(())
 }
 
-fn emit<T: Serialize + std::fmt::Debug>(json_output: bool, value: &T) -> Result<()> {
+fn emit_status(json_output: bool, value: &ContextStatus) -> Result<()> {
     if json_output {
         println!("{}", serde_json::to_string_pretty(value)?);
     } else {
-        println!("{value:#?}");
+        print!("{}", status_markdown(value));
     }
     Ok(())
 }
@@ -229,11 +237,13 @@ fn init(
     ensure_git_repository(&repository)?;
     let root = library_root(&repository);
     if root.exists() && !force {
-        bail!("Project Context Library already exists at {}", root.display());
+        bail!(
+            "Project Context Library already exists at {}",
+            root.display()
+        );
     }
     if root.exists() {
-        fs::remove_dir_all(&root)
-            .with_context(|| format!("failed to reset {}", root.display()))?;
+        fs::remove_dir_all(&root).with_context(|| format!("failed to reset {}", root.display()))?;
     }
     let project = project
         .map(str::to_owned)
@@ -248,50 +258,66 @@ fn init(
         schema_version: PROFILE_SCHEMA_VERSION.to_owned(),
         project,
         library_id: id.to_owned(),
-        repository: repository.clone(),
+        repository: PathBuf::from("."),
         validated_revision: None,
         impact_rules: default_impact_rules(id),
-        excluded_prefixes: vec![
-            LIBRARY_DIR.to_owned(),
-            ".okf/cache".to_owned(),
-            ".okf/libraries.json".to_owned(),
-        ],
+        excluded_prefixes: default_excluded_prefixes(),
     };
     save_profile(&root, &profile)?;
     if mount {
         mount_library(&repository)?;
     }
+    let profile = bind_profile_repository(profile, &repository);
     compute_status(&profile)
 }
 
 fn status_for_repository(repository: &Path) -> Result<ContextStatus> {
     let repository = canonical_repository(repository)?;
-    ensure_git_repository(&repository)?;
     let root = library_root(&repository);
     if !profile_path(&root).is_file() {
-        return Ok(ContextStatus {
-            state: ContextState::Uninitialized,
-            project: repository.file_name().map_or_else(
-                || "project".to_owned(),
-                |value| value.to_string_lossy().into_owned(),
-            ),
-            library_id: DEFAULT_LIBRARY_ID.to_owned(),
-            repository: repository.clone(),
-            validated_revision: None,
-            current_revision: current_revision(&repository).ok(),
-            branch: current_branch(&repository),
-            changed_paths: working_tree_paths(&repository, &[LIBRARY_DIR.to_owned()])
-                .unwrap_or_default(),
-            impacted_topics: Vec::new(),
-        });
+        return uninitialized_status(&repository);
     }
-    compute_status(&load_profile(&root)?)
+    let profile = load_profile_for_repository(&root, &repository)?;
+    compute_status(&profile)
+}
+
+fn uninitialized_status(repository: &Path) -> Result<ContextStatus> {
+    let mut diagnostics = Vec::new();
+    let current_revision = match current_revision_optional(repository) {
+        Ok(revision) => revision,
+        Err(error) => {
+            diagnostics.push(format!("failed to resolve current revision: {error:#}"));
+            None
+        }
+    };
+    let changed_paths = match working_tree_paths(repository, &default_excluded_prefixes()) {
+        Ok(paths) => paths,
+        Err(error) => {
+            diagnostics.push(format!("failed to inspect working tree: {error:#}"));
+            Vec::new()
+        }
+    };
+    Ok(ContextStatus {
+        state: ContextState::Uninitialized,
+        project: repository.file_name().map_or_else(
+            || "project".to_owned(),
+            |value| value.to_string_lossy().into_owned(),
+        ),
+        library_id: DEFAULT_LIBRARY_ID.to_owned(),
+        repository: repository.to_path_buf(),
+        validated_revision: None,
+        current_revision,
+        branch: current_branch(repository),
+        changed_paths,
+        impacted_topics: all_current_topics(DEFAULT_LIBRARY_ID),
+        diagnostics,
+    })
 }
 
 fn checkpoint(repository: &Path, revision: Option<&str>) -> Result<ContextStatus> {
     let repository = canonical_repository(repository)?;
     let root = library_root(&repository);
-    let mut profile = load_profile(&root)?;
+    let mut profile = load_profile_for_repository(&root, &repository)?;
     let working_paths = working_tree_paths(&profile.repository, &profile.excluded_prefixes)?;
     if !working_paths.is_empty() {
         bail!(
@@ -318,7 +344,7 @@ fn checkpoint(repository: &Path, revision: Option<&str>) -> Result<ContextStatus
 fn mount_library(repository: &Path) -> Result<ContextStatus> {
     let repository = canonical_repository(repository)?;
     let root = library_root(&repository);
-    let profile = load_profile(&root)?;
+    let profile = load_profile_for_repository(&root, &repository)?;
     let registry = repository.join(".okf/libraries.json");
 
     let add = ProcessCommand::new("okf")
@@ -357,9 +383,20 @@ fn serve_provider(explicit_root: Option<&Path>) -> Result<()> {
         .or_else(|| std::env::var_os("OKF_LIBRARY_ROOT").map(PathBuf::from))
         .ok_or_else(|| anyhow!("provider requires --library-root or OKF_LIBRARY_ROOT"))?;
     let root = root.canonicalize().unwrap_or(root);
-    let profile = load_profile(&root)?;
+    let repository = repository_from_library_root(&root)?;
+    let profile = load_profile_for_repository(&root, &repository)?;
     let mut input = Vec::new();
-    std::io::stdin().read_to_end(&mut input)?;
+    let mut stdin = std::io::stdin().lock();
+    stdin
+        .by_ref()
+        .take((MAX_PROVIDER_REQUEST_BYTES + 1) as u64)
+        .read_to_end(&mut input)?;
+    if input.len() > MAX_PROVIDER_REQUEST_BYTES {
+        bail!(
+            "provider request exceeds the {} byte limit",
+            MAX_PROVIDER_REQUEST_BYTES
+        );
+    }
     let request: ProviderRequest =
         serde_json::from_slice(&input).context("failed to parse okf-provider/1 request")?;
     let response = match handle_provider_request(&root, &profile, request) {
@@ -375,7 +412,11 @@ fn serve_provider(explicit_root: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-fn handle_provider_request(root: &Path, profile: &Profile, request: ProviderRequest) -> Result<Value> {
+fn handle_provider_request(
+    root: &Path,
+    profile: &Profile,
+    request: ProviderRequest,
+) -> Result<Value> {
     if request.protocol != PROVIDER_PROTOCOL {
         bail!("unsupported provider protocol '{}'", request.protocol);
     }
@@ -414,12 +455,54 @@ fn handle_provider_request(root: &Path, profile: &Profile, request: ProviderRequ
 fn build_catalog(profile: &Profile) -> LibraryCatalog {
     let id = &profile.library_id;
     let mut entries = vec![
-        catalog_entry(id, "status", "Live project freshness", "Current Git revision, working-tree freshness, and impacted topics.", "status", &["status", "freshness", "revision", "dirty"]),
-        catalog_entry(id, "architecture", "Architecture", "Current architecture, boundaries, dependencies, and major flows.", "current/architecture", &["architecture", "modules", "boundaries"]),
-        catalog_entry(id, "constraints", "Constraints", "Durable product and technical constraints.", "current/constraints", &["constraints", "invariants", "rules"]),
-        catalog_entry(id, "decisions", "Decisions", "Active decisions, rationale, and supersession notes.", "current/decisions", &["decisions", "adr", "rationale"]),
-        catalog_entry(id, "components", "Components", "Current component responsibilities and ownership boundaries.", "current/components", &["components", "modules", "packages"]),
-        catalog_entry(id, "history", "Project history", "Append-only material context changes and validated checkpoints.", "history/log", &["history", "changes", "checkpoint"]),
+        catalog_entry(
+            id,
+            "status",
+            "Live project freshness",
+            "Current Git revision, working-tree freshness, and impacted topics.",
+            "status",
+            &["status", "freshness", "revision", "dirty"],
+        ),
+        catalog_entry(
+            id,
+            "architecture",
+            "Architecture",
+            "Current architecture, boundaries, dependencies, and major flows.",
+            "current/architecture",
+            &["architecture", "modules", "boundaries"],
+        ),
+        catalog_entry(
+            id,
+            "constraints",
+            "Constraints",
+            "Durable product and technical constraints.",
+            "current/constraints",
+            &["constraints", "invariants", "rules"],
+        ),
+        catalog_entry(
+            id,
+            "decisions",
+            "Decisions",
+            "Active decisions, rationale, and supersession notes.",
+            "current/decisions",
+            &["decisions", "adr", "rationale"],
+        ),
+        catalog_entry(
+            id,
+            "components",
+            "Components",
+            "Current component responsibilities and ownership boundaries.",
+            "current/components",
+            &["components", "modules", "packages"],
+        ),
+        catalog_entry(
+            id,
+            "history",
+            "Project history",
+            "Append-only material context changes and validated checkpoints.",
+            "history/log",
+            &["history", "changes", "checkpoint"],
+        ),
     ];
     entries.sort_by(|left, right| left.id.cmp(&right.id));
     LibraryCatalog {
@@ -451,17 +534,53 @@ fn list_nodes(profile: &Profile, path: &str) -> Result<Vec<KnowledgeNode>> {
     let nodes = match path.as_str() {
         "" => vec![
             node(id, "index", "content", Some("Project Context"), false),
-            node(id, "status", "content", Some("Live project freshness"), true),
-            node(id, "current", "directory", Some("Current project knowledge"), false),
+            node(
+                id,
+                "status",
+                "content",
+                Some("Live project freshness"),
+                true,
+            ),
+            node(
+                id,
+                "current",
+                "directory",
+                Some("Current project knowledge"),
+                false,
+            ),
             node(id, "history", "directory", Some("Project history"), false),
         ],
         "current" => vec![
-            node(id, "current/architecture", "content", Some("Architecture"), false),
-            node(id, "current/constraints", "content", Some("Constraints"), false),
+            node(
+                id,
+                "current/architecture",
+                "content",
+                Some("Architecture"),
+                false,
+            ),
+            node(
+                id,
+                "current/constraints",
+                "content",
+                Some("Constraints"),
+                false,
+            ),
             node(id, "current/decisions", "content", Some("Decisions"), false),
-            node(id, "current/components", "content", Some("Components"), false),
+            node(
+                id,
+                "current/components",
+                "content",
+                Some("Components"),
+                false,
+            ),
         ],
-        "history" => vec![node(id, "history/log", "content", Some("Project history"), false)],
+        "history" => vec![node(
+            id,
+            "history/log",
+            "content",
+            Some("Project history"),
+            false,
+        )],
         _ => Vec::new(),
     };
     Ok(nodes)
@@ -501,7 +620,8 @@ fn read_node(root: &Path, profile: &Profile, path: &str) -> Result<String> {
 }
 
 fn query_library(root: &Path, profile: &Profile, query: &ProviderQuery) -> Result<QueryResult> {
-    let needle = query.text.trim().to_lowercase();
+    let phrase = query.text.trim().to_lowercase();
+    let terms = query_terms(&phrase);
     let candidates = [
         ("status", "Live project freshness"),
         ("current/architecture", "Architecture"),
@@ -513,27 +633,16 @@ fn query_library(root: &Path, profile: &Profile, query: &ProviderQuery) -> Resul
     let mut hits = Vec::new();
     for (path, title) in candidates {
         let content = read_node(root, profile, path)?;
-        let path_match = path.to_lowercase().contains(&needle);
-        let title_match = title.to_lowercase().contains(&needle);
-        let content_match = content.to_lowercase().contains(&needle);
-        if !needle.is_empty() && !(path_match || title_match || content_match) {
+        let Some((score, matched_terms)) = lexical_score(path, title, &content, &phrase, &terms)
+        else {
             continue;
-        }
-        let score = if needle.is_empty() {
-            0.0
-        } else if path_match {
-            3.0
-        } else if title_match {
-            2.0
-        } else {
-            1.0
         };
         hits.push(QueryHit {
             uri: format!("okf://{}/{path}", profile.library_id),
             title: Some(title.to_owned()),
             snippet: Some(truncate(&content, 240)),
             score: Some(score),
-            metadata: BTreeMap::new(),
+            metadata: BTreeMap::from([("matched_terms".to_owned(), matched_terms.to_string())]),
         });
     }
     hits.sort_by(|left, right| {
@@ -556,38 +665,127 @@ fn query_library(root: &Path, profile: &Profile, query: &ProviderQuery) -> Resul
     })
 }
 
-fn compute_status(profile: &Profile) -> Result<ContextStatus> {
-    if profile.schema_version != PROFILE_SCHEMA_VERSION {
-        bail!("unsupported profile schema '{}'", profile.schema_version);
+fn query_terms(value: &str) -> Vec<String> {
+    value
+        .split(|character: char| {
+            !character.is_alphanumeric() && character != '_' && character != '-'
+        })
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn lexical_score(
+    path: &str,
+    title: &str,
+    content: &str,
+    phrase: &str,
+    terms: &[String],
+) -> Option<(f64, usize)> {
+    if phrase.is_empty() {
+        return Some((0.0, 0));
     }
-    let current = current_revision(&profile.repository).ok();
+    let path = path.to_lowercase();
+    let title = title.to_lowercase();
+    let content = content.to_lowercase();
+    let mut score = 0.0;
+    if path.contains(phrase) {
+        score += 20.0;
+    } else if title.contains(phrase) {
+        score += 12.0;
+    } else if content.contains(phrase) {
+        score += 6.0;
+    }
+
+    let mut matched_terms = 0;
+    for term in terms {
+        if path.contains(term) {
+            score += 5.0;
+            matched_terms += 1;
+        } else if title.contains(term) {
+            score += 3.0;
+            matched_terms += 1;
+        } else if content.contains(term) {
+            score += 1.0;
+            matched_terms += 1;
+        }
+    }
+    if score == 0.0 && matched_terms == 0 {
+        None
+    } else {
+        if !terms.is_empty() {
+            score += matched_terms as f64 / terms.len() as f64;
+        }
+        Some((score, matched_terms))
+    }
+}
+
+fn compute_status(profile: &Profile) -> Result<ContextStatus> {
+    validate_profile(profile)?;
+    let mut diagnostics = Vec::new();
+    let current = match current_revision_optional(&profile.repository) {
+        Ok(revision) => revision,
+        Err(error) => {
+            diagnostics.push(format!("failed to resolve current revision: {error:#}"));
+            None
+        }
+    };
     let branch = current_branch(&profile.repository);
-    let working =
-        working_tree_paths(&profile.repository, &profile.excluded_prefixes).unwrap_or_default();
+    let (working, working_known) =
+        match working_tree_paths(&profile.repository, &profile.excluded_prefixes) {
+            Ok(paths) => (paths, true),
+            Err(error) => {
+                diagnostics.push(format!("failed to inspect working tree: {error:#}"));
+                (Vec::new(), false)
+            }
+        };
+
     let (state, changed_paths) = match (&profile.validated_revision, &current) {
         (None, _) => (ContextState::Uninitialized, working),
         (Some(_), None) => (ContextState::Unknown, working),
         (Some(validated), Some(current)) if validated == current => {
-            if working.is_empty() {
+            if !working_known {
+                (ContextState::Unknown, working)
+            } else if working.is_empty() {
                 (ContextState::Valid, Vec::new())
             } else {
                 (ContextState::Dirty, working)
             }
         }
-        (Some(validated), Some(current)) => match changed_paths(&profile.repository, validated, current)
-        {
-            Ok(committed) => (
-                ContextState::Dirty,
-                merge_paths(filter_paths(committed, &profile.excluded_prefixes), working),
-            ),
-            Err(_) => (ContextState::Unknown, working),
-        },
+        (Some(validated), Some(current)) => {
+            match changed_paths(&profile.repository, validated, current) {
+                Ok(committed) => {
+                    let changed =
+                        merge_paths(filter_paths(committed, &profile.excluded_prefixes), working);
+                    if !working_known {
+                        (ContextState::Unknown, changed)
+                    } else if changed.is_empty() {
+                        // A commit containing only Project Context/runtime files does not
+                        // invalidate the project revision that the knowledge describes.
+                        (ContextState::Valid, Vec::new())
+                    } else {
+                        (ContextState::Dirty, changed)
+                    }
+                }
+                Err(error) => {
+                    diagnostics.push(format!(
+                        "failed to compare validated and current revisions: {error:#}"
+                    ));
+                    (ContextState::Unknown, working)
+                }
+            }
+        }
     };
-    let impacted_topics = impacted_topics(
-        &changed_paths,
-        &profile.impact_rules,
-        &profile.library_id,
-    );
+    let mut impacted_topics =
+        impacted_topics(&changed_paths, &profile.impact_rules, &profile.library_id);
+    if impacted_topics.is_empty()
+        && matches!(state, ContextState::Uninitialized | ContextState::Unknown)
+    {
+        impacted_topics = all_current_topics(&profile.library_id);
+    }
     Ok(ContextStatus {
         state,
         project: profile.project.clone(),
@@ -598,18 +796,74 @@ fn compute_status(profile: &Profile) -> Result<ContextStatus> {
         branch,
         changed_paths,
         impacted_topics,
+        diagnostics,
     })
 }
 
 fn create_scaffold(root: &Path, id: &str, project: &str) -> Result<()> {
     fs::create_dir_all(root.join("current"))?;
     fs::create_dir_all(root.join("history"))?;
-    fs::write(
-        root.join("okf-library.yaml"),
-        format!(
-            "schema_version: \"1\"\nid: {id}\nname: {project} Project Context\nversion: \"0.1\"\n\ncatalog:\n  - id: status\n    title: Live project freshness\n    description: Current Git revision, working-tree freshness, and impacted topics.\n    path: status\n    terms: [status, freshness, revision, dirty]\n  - id: architecture\n    title: Architecture\n    path: current/architecture\n    terms: [architecture, modules, boundaries]\n  - id: constraints\n    title: Constraints\n    path: current/constraints\n    terms: [constraints, invariants, rules]\n  - id: decisions\n    title: Decisions\n    path: current/decisions\n    terms: [decisions, adr, rationale]\n  - id: components\n    title: Components\n    path: current/components\n    terms: [components, modules, packages]\n  - id: history\n    title: Project history\n    path: history/log\n    terms: [history, changes, checkpoints]\n\nquery:\n  preferred: lexical\n  capabilities: [lexical]\n  hints:\n    - Read status before broad repository exploration.\n    - Prefer current/ for present-tense project understanding.\n    - Use history/log for why and when the project changed.\n\nproviders:\n  - id: project-context-runtime\n    kind: process\n    capabilities: [catalog, list, read, query, refresh]\n    config:\n      command: project-context\n      args: [provider, --library-root, \"${{library_root}}\"]\n"
-        ),
-    )?;
+    ensure_runtime_gitignore(root)?;
+    let library_name = format!("{project} Project Context");
+    let manifest = format!(
+        r#"schema_version: "1"
+id: {id}
+name: {name}
+version: "0.1.0"
+
+catalog:
+  - id: status
+    title: Live project freshness
+    description: Current Git revision, working-tree freshness, and impacted topics.
+    path: status
+    terms: [status, freshness, revision, dirty]
+  - id: architecture
+    title: Architecture
+    description: Current architecture, boundaries, dependencies, and major flows.
+    path: current/architecture
+    terms: [architecture, modules, boundaries]
+  - id: constraints
+    title: Constraints
+    description: Durable product and technical constraints.
+    path: current/constraints
+    terms: [constraints, invariants, rules]
+  - id: decisions
+    title: Decisions
+    description: Active decisions, rationale, and supersession notes.
+    path: current/decisions
+    terms: [decisions, adr, rationale]
+  - id: components
+    title: Components
+    description: Current component responsibilities and ownership boundaries.
+    path: current/components
+    terms: [components, modules, packages]
+  - id: history
+    title: Project history
+    description: Append-only material context changes and validated checkpoints.
+    path: history/log
+    terms: [history, changes, checkpoints]
+
+query:
+  preferred: lexical
+  capabilities: [lexical]
+  hints:
+    - Read status before broad repository exploration.
+    - Prefer current/ for present-tense project understanding.
+    - Use history/log for why and when the project changed.
+
+providers:
+  - id: project-context-runtime
+    kind: process
+    capabilities: [catalog, list, read, query, refresh]
+    config:
+      command: project-context
+      args: [provider, --library-root, "${{library_root}}"]
+      timeout_ms: 30000
+"#,
+        id = yaml_string(id)?,
+        name = yaml_string(&library_name)?,
+    );
+    fs::write(root.join("okf-library.yaml"), manifest)?;
     write_doc(
         &root.join("index.md"),
         "Project Context",
@@ -643,6 +897,29 @@ fn create_scaffold(root: &Path, id: &str, project: &str) -> Result<()> {
     Ok(())
 }
 
+fn ensure_runtime_gitignore(root: &Path) -> Result<()> {
+    let okf_dir = root
+        .parent()
+        .ok_or_else(|| anyhow!("Library root has no .okf parent"))?;
+    let path = okf_dir.join(".gitignore");
+    let mut content = fs::read_to_string(&path).unwrap_or_default();
+    for required in ["/cache/", "/libraries.json", "/state/"] {
+        if content.lines().any(|line| line.trim() == required) {
+            continue;
+        }
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(required);
+        content.push('\n');
+    }
+    fs::write(&path, content).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn yaml_string(value: &str) -> Result<String> {
+    serde_json::to_string(value).context("failed to quote YAML string")
+}
+
 fn write_doc(path: &Path, title: &str, summary: &str) -> Result<()> {
     fs::write(
         path,
@@ -653,31 +930,75 @@ fn write_doc(path: &Path, title: &str, summary: &str) -> Result<()> {
     .with_context(|| format!("failed to write {}", path.display()))
 }
 
+fn default_excluded_prefixes() -> Vec<String> {
+    vec![
+        LIBRARY_DIR.to_owned(),
+        ".okf/.gitignore".to_owned(),
+        ".okf/cache".to_owned(),
+        ".okf/libraries.json".to_owned(),
+        ".okf/state".to_owned(),
+    ]
+}
+
 fn default_impact_rules(id: &str) -> Vec<ImpactRule> {
     vec![
         ImpactRule {
             topic: format!("okf://{id}/current/architecture"),
-            path_prefixes: vec!["src".into(), "packages".into(), "crates".into(), "docs".into()],
+            path_prefixes: vec![
+                "src".into(),
+                "app".into(),
+                "apps".into(),
+                "packages".into(),
+                "crates".into(),
+                "services".into(),
+                "modules".into(),
+                "docs".into(),
+                "api".into(),
+                "proto".into(),
+            ],
         },
         ImpactRule {
             topic: format!("okf://{id}/current/components"),
-            path_prefixes: vec!["src".into(), "packages".into(), "crates".into()],
+            path_prefixes: vec![
+                "src".into(),
+                "app".into(),
+                "apps".into(),
+                "packages".into(),
+                "crates".into(),
+                "services".into(),
+                "modules".into(),
+            ],
         },
         ImpactRule {
             topic: format!("okf://{id}/current/constraints"),
             path_prefixes: vec![
                 ".github".into(),
                 "Cargo.toml".into(),
+                "Cargo.lock".into(),
                 "package.json".into(),
+                "package-lock.json".into(),
+                "pnpm-lock.yaml".into(),
+                "yarn.lock".into(),
                 "pom.xml".into(),
                 "build.gradle".into(),
                 "go.mod".into(),
                 "pyproject.toml".into(),
+                "Dockerfile".into(),
+                "docker-compose.yml".into(),
+                "Makefile".into(),
+                "justfile".into(),
+                "infra".into(),
+                "deploy".into(),
             ],
         },
         ImpactRule {
             topic: format!("okf://{id}/current/decisions"),
-            path_prefixes: vec!["docs".into(), "adr".into(), "decisions".into()],
+            path_prefixes: vec![
+                "docs".into(),
+                "adr".into(),
+                "decisions".into(),
+                "rfcs".into(),
+            ],
         },
     ]
 }
@@ -688,11 +1009,11 @@ fn impacted_topics(changed: &[String], rules: &[ImpactRule], library_id: &str) -
     }
     let mut topics = BTreeSet::new();
     for rule in rules {
-        if rule.path_prefixes.iter().any(|prefix| {
-            changed
-                .iter()
-                .any(|path| path_matches_prefix(path, prefix))
-        }) {
+        if rule
+            .path_prefixes
+            .iter()
+            .any(|prefix| changed.iter().any(|path| path_matches_prefix(path, prefix)))
+        {
             topics.insert(rule.topic.clone());
         }
     }
@@ -720,15 +1041,33 @@ fn status_markdown(status: &ContextStatus) -> String {
     } else {
         status.impacted_topics.join(", ")
     };
+    let diagnostics = if status.diagnostics.is_empty() {
+        "none".to_owned()
+    } else {
+        status.diagnostics.join(" | ")
+    };
     format!(
-        "# Project Context Status\n\n- state: {}\n- project: {}\n- branch: {}\n- validated revision: {}\n- current revision: {}\n- changed paths: {}\n- impacted topics: {}\n",
+        "# Project Context Status
+
+- state: {}
+- project: {}
+- repository: {}
+- branch: {}
+- validated revision: {}
+- current revision: {}
+- changed paths: {}
+- impacted topics: {}
+- diagnostics: {}
+",
         status.state,
         status.project,
+        status.repository.display(),
         status.branch.as_deref().unwrap_or("<detached-or-unknown>"),
         status.validated_revision.as_deref().unwrap_or("<none>"),
-        status.current_revision.as_deref().unwrap_or("<unknown>"),
+        status.current_revision.as_deref().unwrap_or("<none>"),
         changed,
-        impacted
+        impacted,
+        diagnostics,
     )
 }
 
@@ -739,23 +1078,66 @@ fn append_history(root: &Path, revision: &str) -> Result<()> {
         .as_secs();
     let path = root.join("history/log.md");
     let mut content = fs::read_to_string(&path).unwrap_or_default();
+    let marker = format!("## Checkpoint {revision}");
+    if content.lines().any(|line| line.trim() == marker) {
+        return Ok(());
+    }
     content.push_str(&format!(
-        "\n## Checkpoint {revision}\n\n- unix_time: {timestamp}\n- validated_revision: {revision}\n"
+        "
+## Checkpoint {revision}
+
+- unix_time: {timestamp}
+- validated_revision: {revision}
+"
     ));
     fs::write(&path, content).with_context(|| format!("failed to write {}", path.display()))
 }
 
 fn canonical_repository(path: &Path) -> Result<PathBuf> {
-    path.canonicalize()
-        .with_context(|| format!("failed to resolve repository {}", path.display()))
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("failed to resolve repository {}", path.display()))?;
+    let root = git_output(&path, &["rev-parse", "--show-toplevel"])
+        .with_context(|| format!("{} is not inside a Git working tree", path.display()))?;
+    PathBuf::from(root)
+        .canonicalize()
+        .context("failed to canonicalize Git repository root")
 }
 
 fn ensure_git_repository(repository: &Path) -> Result<()> {
-    current_revision(repository).map(|_| ())
+    let inside = git_output(repository, &["rev-parse", "--is-inside-work-tree"])?;
+    if inside == "true" {
+        Ok(())
+    } else {
+        bail!("{} is not a Git working tree", repository.display())
+    }
 }
 
 fn current_revision(repository: &Path) -> Result<String> {
-    git_output(repository, &["rev-parse", "HEAD"])
+    current_revision_optional(repository)?.ok_or_else(|| {
+        anyhow!(
+            "repository '{}' does not have a commit yet",
+            repository.display()
+        )
+    })
+}
+
+fn current_revision_optional(repository: &Path) -> Result<Option<String>> {
+    let output = git_process_output(repository, &["rev-parse", "--verify", "--quiet", "HEAD"])?;
+    if output.status.success() {
+        let revision = String::from_utf8(output.stdout)
+            .map_err(|error| anyhow!("git output was not UTF-8: {error}"))?
+            .trim()
+            .to_owned();
+        Ok((!revision.is_empty()).then_some(revision))
+    } else if output.stderr.is_empty() {
+        Ok(None)
+    } else {
+        bail!(
+            "git rev-parse --verify --quiet HEAD failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
 }
 
 fn current_branch(repository: &Path) -> Option<String> {
@@ -774,7 +1156,13 @@ fn resolve_revision(repository: &Path, revision: &str) -> Result<String> {
 fn changed_paths(repository: &Path, from: &str, to: &str) -> Result<Vec<String>> {
     let output = git_output(
         repository,
-        &["diff", "--name-only", &format!("{from}..{to}")],
+        &[
+            "diff",
+            "--find-renames",
+            "--name-only",
+            &format!("{from}..{to}"),
+            "--",
+        ],
     )?;
     Ok(lines(&output))
 }
@@ -811,7 +1199,11 @@ fn merge_paths(left: Vec<String>, right: Vec<String>) -> Vec<String> {
 fn filter_paths(paths: Vec<String>, excluded: &[String]) -> Vec<String> {
     paths
         .into_iter()
-        .filter(|path| !excluded.iter().any(|prefix| path_matches_prefix(path, prefix)))
+        .filter(|path| {
+            !excluded
+                .iter()
+                .any(|prefix| path_matches_prefix(path, prefix))
+        })
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -836,13 +1228,17 @@ fn normalize_repo_path(value: &str) -> String {
         .to_owned()
 }
 
-fn git_output(repository: &Path, args: &[&str]) -> Result<String> {
-    let output = ProcessCommand::new("git")
-        .arg("-C")
+fn git_process_output(repository: &Path, args: &[&str]) -> Result<Output> {
+    ProcessCommand::new("git")
+        .args(["-c", "core.quotepath=false", "-C"])
         .arg(repository)
         .args(args)
         .output()
-        .with_context(|| format!("failed to execute git {}", args.join(" ")))?;
+        .with_context(|| format!("failed to execute git {}", args.join(" ")))
+}
+
+fn git_output(repository: &Path, args: &[&str]) -> Result<String> {
+    let output = git_process_output(repository, args)?;
     if !output.status.success() {
         bail!(
             "git {} failed: {}",
@@ -891,19 +1287,65 @@ fn load_profile(root: &Path) -> Result<Profile> {
     let bytes = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let profile: Profile = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed to parse {}", path.display()))?;
+    validate_profile(&profile)?;
+    Ok(profile)
+}
+
+fn load_profile_for_repository(root: &Path, repository: &Path) -> Result<Profile> {
+    Ok(bind_profile_repository(load_profile(root)?, repository))
+}
+
+fn bind_profile_repository(mut profile: Profile, repository: &Path) -> Profile {
+    profile.repository = repository.to_path_buf();
+    profile
+}
+
+fn repository_from_library_root(root: &Path) -> Result<PathBuf> {
+    let okf_dir = root
+        .parent()
+        .ok_or_else(|| anyhow!("Library root has no .okf parent"))?;
+    let repository = okf_dir
+        .parent()
+        .ok_or_else(|| anyhow!(".okf directory has no repository parent"))?;
+    canonical_repository(repository)
+}
+
+fn validate_profile(profile: &Profile) -> Result<()> {
     if profile.schema_version != PROFILE_SCHEMA_VERSION {
         bail!(
             "unsupported Project Context profile schema version '{}'",
             profile.schema_version
         );
     }
-    Ok(profile)
+    if profile.project.trim().is_empty() {
+        bail!("Project Context profile project name must not be empty");
+    }
+    validate_library_id(&profile.library_id)?;
+    for rule in &profile.impact_rules {
+        uri_path(&rule.topic, &profile.library_id)
+            .with_context(|| format!("impact rule topic '{}' is invalid", rule.topic))?;
+        validate_repo_prefixes(&rule.path_prefixes)?;
+    }
+    validate_repo_prefixes(&profile.excluded_prefixes)
+}
+
+fn validate_repo_prefixes(prefixes: &[String]) -> Result<()> {
+    for prefix in prefixes {
+        let normalized = normalize_repo_path(prefix);
+        if normalized.is_empty() || normalized.split('/').any(|segment| segment == "..") {
+            bail!("invalid repository path prefix '{prefix}'");
+        }
+    }
+    Ok(())
 }
 
 fn save_profile(root: &Path, profile: &Profile) -> Result<()> {
     fs::create_dir_all(root)?;
+    let mut portable = profile.clone();
+    portable.repository = PathBuf::from(".");
+    validate_profile(&portable)?;
     let path = profile_path(root);
-    let mut bytes = serde_json::to_vec_pretty(profile)?;
+    let mut bytes = serde_json::to_vec_pretty(&portable)?;
     bytes.push(b'\n');
     fs::write(&path, bytes).with_context(|| format!("failed to write {}", path.display()))
 }
@@ -962,6 +1404,45 @@ fn default_query_limit() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::{TempDir, tempdir};
+
+    fn run_git(repository: &Path, args: &[&str]) -> String {
+        let output = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args(args)
+            .output()
+            .expect("git command");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("UTF-8 git output")
+            .trim()
+            .to_owned()
+    }
+
+    fn repository(with_commit: bool) -> TempDir {
+        let repository = tempdir().expect("temporary repository");
+        run_git(repository.path(), &["init"]);
+        run_git(
+            repository.path(),
+            &["config", "user.name", "Project Context Tests"],
+        );
+        run_git(
+            repository.path(),
+            &["config", "user.email", "project-context@example.invalid"],
+        );
+        if with_commit {
+            fs::write(repository.path().join("README.md"), "# Demo\n").expect("write README");
+            run_git(repository.path(), &["add", "README.md"]);
+            run_git(repository.path(), &["commit", "-m", "initial"]);
+        }
+        repository
+    }
 
     #[test]
     fn rejects_knowledge_path_traversal() {
@@ -991,5 +1472,139 @@ mod tests {
     fn library_ids_are_portable() {
         assert!(validate_library_id("project-context.v1").is_ok());
         assert!(validate_library_id("../project").is_err());
+    }
+
+    #[test]
+    fn repository_root_is_discovered_from_nested_directory() {
+        let repository = repository(true);
+        let nested = repository.path().join("src/nested");
+        fs::create_dir_all(&nested).expect("nested directory");
+        let root = canonical_repository(&nested).expect("repository root");
+        assert_eq!(
+            root,
+            repository.path().canonicalize().expect("canonical root")
+        );
+    }
+
+    #[test]
+    fn empty_repository_can_initialize_but_not_checkpoint() {
+        let repository = repository(false);
+        let status = init(
+            repository.path(),
+            Some("Empty project"),
+            DEFAULT_LIBRARY_ID,
+            false,
+            false,
+        )
+        .expect("initialize");
+        assert_eq!(status.state, ContextState::Uninitialized);
+        assert!(status.current_revision.is_none());
+        let error = checkpoint(repository.path(), None).expect_err("checkpoint must fail");
+        assert!(error.to_string().contains("does not have a commit yet"));
+    }
+
+    #[test]
+    fn context_only_commits_do_not_invalidate_project_knowledge() {
+        let repository = repository(true);
+        init(
+            repository.path(),
+            Some("Demo"),
+            DEFAULT_LIBRARY_ID,
+            false,
+            false,
+        )
+        .expect("initialize");
+        let checkpointed = checkpoint(repository.path(), None).expect("checkpoint");
+        assert_eq!(checkpointed.state, ContextState::Valid);
+        run_git(repository.path(), &["add", ".okf"]);
+        run_git(
+            repository.path(),
+            &["commit", "-m", "chore: add project context"],
+        );
+
+        let valid = status_for_repository(repository.path()).expect("status");
+        assert_eq!(valid.state, ContextState::Valid);
+        assert!(valid.changed_paths.is_empty());
+
+        fs::create_dir_all(repository.path().join("src")).expect("src directory");
+        fs::write(
+            repository.path().join("src/lib.rs"),
+            "pub fn changed() {}\n",
+        )
+        .expect("source change");
+        let dirty = status_for_repository(repository.path()).expect("dirty status");
+        assert_eq!(dirty.state, ContextState::Dirty);
+        assert!(dirty.changed_paths.contains(&"src/lib.rs".to_owned()));
+        assert!(
+            dirty
+                .impacted_topics
+                .contains(&"okf://project-context/current/architecture".to_owned())
+        );
+        assert!(
+            dirty
+                .impacted_topics
+                .contains(&"okf://project-context/current/components".to_owned())
+        );
+    }
+
+    #[test]
+    fn generated_profile_is_portable() {
+        let repository = repository(true);
+        init(
+            repository.path(),
+            Some("Portable"),
+            DEFAULT_LIBRARY_ID,
+            false,
+            false,
+        )
+        .expect("initialize");
+        let value: Value = serde_json::from_slice(
+            &fs::read(profile_path(&library_root(repository.path()))).expect("profile"),
+        )
+        .expect("profile JSON");
+        assert_eq!(value["repository"], ".");
+    }
+
+    #[test]
+    fn provider_query_matches_individual_terms() {
+        let repository = repository(true);
+        init(
+            repository.path(),
+            Some("Query"),
+            DEFAULT_LIBRARY_ID,
+            false,
+            false,
+        )
+        .expect("initialize");
+        let root = library_root(repository.path());
+        fs::write(
+            root.join("current/architecture.md"),
+            "# Architecture\n\nThe runtime composes mounted providers.\n",
+        )
+        .expect("architecture knowledge");
+        let profile = load_profile_for_repository(&root, repository.path()).expect("profile");
+        let result = query_library(
+            &root,
+            &profile,
+            &ProviderQuery {
+                text: "runtime architecture".to_owned(),
+                limit: 20,
+            },
+        )
+        .expect("query");
+        assert!(
+            result
+                .hits
+                .iter()
+                .any(|hit| hit.uri.ends_with("/current/architecture"))
+        );
+    }
+
+    #[test]
+    fn yaml_strings_are_quoted_safely() {
+        assert_eq!(
+            yaml_string("Project: demo").expect("quoted"),
+            "\"Project: demo\""
+        );
     }
 }
