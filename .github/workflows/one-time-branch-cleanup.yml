@@ -1,0 +1,30 @@
+name: One-time Project Context branch cleanup
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Delete merged or superseded branches
+        shell: bash
+        run: |
+          set -euo pipefail
+          for branch in \
+            feature/v0.1-runtime \
+            feature/v0.1 \
+            feature/release-v0.1.0 \
+            fix/release-source-package \
+            chore/finalize-release-and-branches; do
+            if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+              git push origin --delete "$branch"
+            fi
+          done
